@@ -2,6 +2,8 @@
 
 A modular, configurable billing analysis CLI tool built with React Ink for analyzing customer billing data from Autumn.
 
+<img width="1634" height="624" alt="Cursor 2025-09-11 18 11 48" src="https://github.com/user-attachments/assets/7b5cb22f-1897-4d37-bf5b-94e38452c575" />
+
 ## Quick Start
 
 ```bash
