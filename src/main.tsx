@@ -1,7 +1,8 @@
 #!/usr/bin/env bun
 import React, { useState, useEffect } from 'react';
 import { render, Box, Text, Spacer, useInput } from 'ink';
-import { Spinner } from '@inkjs/ui';
+import { Spinner, TextInput } from '@inkjs/ui';
+import fuzzysort from 'fuzzysort';
 import { Autumn } from "autumn-js";
 
 // Import external modules
@@ -9,6 +10,10 @@ import { useExternalActions, type ExternalActionsConfig } from './external-actio
 import { useCreditSystem, getCustomerCredits, type CreditSystemConfig } from './credit-system';
 import { useCustomerDetails, type Customer, type CustomerDetailsProps } from './customer-details';
 import { type BillingAnalysisConfig, defaultConfig, configurations } from './billing-config';
+import { FullScreenDetails } from './json-renderer';
+import { QueryClient, QueryClientProvider, useQuery } from '@tanstack/react-query';
+import { sql } from 'bun';
+import Table from './table';
 
 // Custom Table Components (unchanged)
 interface TableColumn {
@@ -23,10 +28,18 @@ interface CustomTableProps {
   columns?: TableColumn[];
 }
 
+interface SimpleTableRow {
+  key: string;
+  label: string;
+  value: any;
+  important?: boolean;
+  formatter?: (val: any) => string;
+}
+
 const CustomTable: React.FC<CustomTableProps> = ({ data, columns }) => {
   if (data.length === 0) return <Text color="gray">No data available</Text>;
 
-  const tableColumns = columns || Object.keys(data[0]).map(key => ({
+  const tableColumns = columns || Object.keys(data[0] || {}).map(key => ({
     key,
     label: key,
     width: Math.max(key.length, 12),
@@ -80,7 +93,7 @@ const CustomTable: React.FC<CustomTableProps> = ({ data, columns }) => {
 const CustomTableWithHighlight: React.FC<CustomTableProps> = ({ data, columns }) => {
   if (data.length === 0) return <Text color="gray">No data available</Text>;
 
-  const tableColumns = columns || Object.keys(data[0])
+  const tableColumns = columns || Object.keys(data[0] || {})
     .filter(key => !key.startsWith('_'))
     .map(key => ({
       key,
@@ -124,12 +137,31 @@ const CustomTableWithHighlight: React.FC<CustomTableProps> = ({ data, columns })
 
       {data.map((row, rowIndex) => {
         const isSelected = row._isSelected;
-        const prefix = isSelected ? '→ ' : '  ';
+        const isMultiSelected = row._isMultiSelected;
+        
+        // Determine display style based on selection states
+        let prefix = '  ';
+        let textColor = 'white';
+        let backgroundColor = undefined;
+        
+        if (isMultiSelected && isSelected) {
+          prefix = '★▶';
+          textColor = 'black';
+          backgroundColor = 'cyan';
+        } else if (isMultiSelected) {
+          prefix = '★ ';
+          textColor = 'cyan';
+        } else if (isSelected) {
+          prefix = '→ ';
+          textColor = 'black';
+          backgroundColor = 'yellow';
+        }
+        
         return (
           <Text
             key={rowIndex}
-            color={isSelected ? 'black' : 'white'}
-            backgroundColor={isSelected ? 'yellow' : undefined}
+            color={textColor}
+            backgroundColor={backgroundColor}
           >
             {prefix}{tableColumns.map((col, index) =>
               formatCell(row[col.key], col.width || 12, col.align) + (index < tableColumns.length - 1 ? ' │ ' : '')
@@ -227,6 +259,7 @@ interface CustomerTableProps {
   planName: string;
   livePlanPrices: { [key: string]: number };
   onMenuStateChange?: (isMenuOpen: boolean) => void;
+  onModalStateChange?: (isModalOpen: boolean) => void;
   config: BillingAnalysisConfig;
 }
 
@@ -235,13 +268,26 @@ const CustomerTable: React.FC<CustomerTableProps> = ({
   planName,
   livePlanPrices,
   onMenuStateChange,
+  onModalStateChange,
   config
 }) => {
+  // Create QueryClient instance for the customer table
+  const queryClient = new QueryClient();
   const [currentPage, setCurrentPage] = useState(0);
   const [selectedCustomerIndex, setSelectedCustomerIndex] = useState(0);
   const [hideZeroCreditUsers, setHideZeroCreditUsers] = useState(false);
+  const [isFullScreenDetailsOpen, setIsFullScreenDetailsOpen] = useState(false);
+  const [isFuzzySearchMode, setIsFuzzySearchMode] = useState(false);
+  const [fuzzySearchQuery, setFuzzySearchQuery] = useState('');
+  const [isHelpOpen, setIsHelpOpen] = useState(false);
+  
+  // Multi-select state
+  const [isMultiSelectMode, setIsMultiSelectMode] = useState(false);
+  const [selectedCustomerIds, setSelectedCustomerIds] = useState<Set<string>>(new Set());
+  const [isBatchMigrationInProgress, setIsBatchMigrationInProgress] = useState(false);
+  const [migrationStatuses, setMigrationStatuses] = useState<Map<string, { status: 'pending' | 'in_progress' | 'completed' | 'failed', message?: string }>>(new Map());
 
-  const itemsPerPage = config.ui?.itemsPerPage || 10;
+  const itemsPerPage = (config.ui?.itemsPerPage ?? 8) || 8; // Reduced to accommodate side panel
 
   // Use external modules
   const externalActions = useExternalActions(config.actions);
@@ -270,10 +316,23 @@ const CustomerTable: React.FC<CustomerTableProps> = ({
         planPrice,
         creditsUsed: credits.total,
         totalValue: planPrice + credits.total,
+        searchableText: `${customer.name || ''} ${customer.email || ''} ${customer.id}`.toLowerCase(),
       };
     })
     .filter(({ creditsUsed }) => !hideZeroCreditUsers || creditsUsed > 0)
-    .sort((a, b) => b.totalValue - a.totalValue);
+    .filter(({ searchableText }) => {
+      if (!fuzzySearchQuery.trim()) return true;
+      const results = fuzzysort.single(fuzzySearchQuery, searchableText);
+      return results !== null;
+    })
+    .sort((a, b) => {
+      if (fuzzySearchQuery.trim()) {
+        const scoreA = fuzzysort.single(fuzzySearchQuery, a.searchableText)?.score || -Infinity;
+        const scoreB = fuzzysort.single(fuzzySearchQuery, b.searchableText)?.score || -Infinity;
+        return scoreB - scoreA; // Higher score first (fuzzysort uses negative scores)
+      }
+      return b.totalValue - a.totalValue;
+    });
 
   const totalPages = Math.ceil(sortedCustomers.length / itemsPerPage);
   const currentCustomers = sortedCustomers.slice(
@@ -295,49 +354,252 @@ const CustomerTable: React.FC<CustomerTableProps> = ({
   // Notify parent of menu state changes
   React.useEffect(() => {
     onMenuStateChange?.(externalActions.isMenuOpen);
-  }, [externalActions.isMenuOpen, onMenuStateChange]);
+    onModalStateChange?.(isFullScreenDetailsOpen || externalActions.isMenuOpen || isFuzzySearchMode || isHelpOpen || externalActions.isComponentDialogOpen || isBatchMigrationInProgress);
+  }, [externalActions.isMenuOpen, isFullScreenDetailsOpen, isFuzzySearchMode, isHelpOpen, externalActions.isComponentDialogOpen, isBatchMigrationInProgress, onMenuStateChange, onModalStateChange]);
 
-  const handleOptionSelect = () => {
-    const customer = currentCustomers[selectedCustomerIndex].customer;
-    externalActions.executeSelectedAction(customer.id, customer);
+  const handleOptionSelect = async () => {
+    if (isMultiSelectMode && selectedCustomerIds.size > 0) {
+      // Handle batch action
+      await handleBatchAction();
+    } else {
+      const customerEntry = currentCustomers[selectedCustomerIndex];
+      if (customerEntry) {
+        await externalActions.executeSelectedAction(customerEntry.customer.id, customerEntry.customer);
+      }
+    }
+  };
+
+  const handleBatchAction = async () => {
+    const selectedCustomers = currentCustomers.filter(c => selectedCustomerIds.has(c.customer.id));
+    if (selectedCustomers.length === 0) return;
+
+    // If migration action is selected, show batch migration view
+    const selectedAction = config.actions?.actions?.[externalActions.selectedActionIndex];
+    if (selectedAction?.id === 'migrate') {
+      setIsBatchMigrationInProgress(true);
+      
+      // Initialize migration statuses
+      const initialStatuses = new Map<string, { status: 'pending' | 'in_progress' | 'completed' | 'failed', message?: string }>();
+      selectedCustomers.forEach(c => {
+        initialStatuses.set(c.customer.id, { status: 'pending' });
+      });
+      setMigrationStatuses(initialStatuses);
+
+      // Prepare batch execution data
+      const customerIds = selectedCustomers.map(c => c.customer.id);
+      const customers = selectedCustomers.map(c => c.customer);
+      
+      // Status callback for batch operations
+      const batchStatusCallback = (customerId: string, status: string) => {
+        // Determine final status based on the message
+        let finalStatus: 'pending' | 'in_progress' | 'completed' | 'failed' = 'in_progress';
+        
+        if (status.startsWith('ERROR:') || status.includes('failed')) {
+          finalStatus = 'failed';
+        } else if (status.includes('completed successfully') || status.includes('No migration required')) {
+          finalStatus = 'completed';
+        }
+        
+        setMigrationStatuses(prev => new Map(prev.set(customerId, { status: finalStatus, message: status })));
+      };
+
+      try {
+        // Execute batch migration
+        await externalActions.executeBatchAction(selectedAction, customerIds, customers, batchStatusCallback);
+      } catch (error) {
+        // Mark any remaining customers as failed if the batch operation fails completely
+        selectedCustomers.forEach(customerEntry => {
+          const currentStatus = migrationStatuses.get(customerEntry.customer.id);
+          if (!currentStatus || currentStatus.status === 'pending' || currentStatus.status === 'in_progress') {
+            setMigrationStatuses(prev => new Map(prev.set(customerEntry.customer.id, { 
+              status: 'failed', 
+              message: error instanceof Error ? error.message : 'Batch operation failed' 
+            })));
+          }
+        });
+      }
+      
+      return;
+    }
+
+    // For other actions, execute batch operation
+    const customerIds = selectedCustomers.map(c => c.customer.id);
+    const customers = selectedCustomers.map(c => c.customer);
+    
+    await externalActions.executeBatchAction(selectedAction, customerIds, customers);
+    
+    // Close multi-select mode after batch execution
+    setIsMultiSelectMode(false);
+    setSelectedCustomerIds(new Set());
+    externalActions.closeMenu();
   };
 
   useInput((input, key) => {
+    // Handle batch migration progress view
+    if (isBatchMigrationInProgress) {
+      if (key.escape) {
+        setIsBatchMigrationInProgress(false);
+        setMigrationStatuses(new Map());
+        setIsMultiSelectMode(false);
+        setSelectedCustomerIds(new Set());
+      }
+      return;
+    }
+
+    // Handle help screen - only allow escape and h to close
+    if (isHelpOpen) {
+      if (key.escape || input === 'h' || input === 'H') {
+        setIsHelpOpen(false);
+      }
+      return;
+    }
+
+    // Handle component dialog - only allow escape to close
+    if (externalActions.isComponentDialogOpen) {
+      if (key.escape) {
+        externalActions.closeComponentDialog();
+      }
+      return;
+    }
+
+    // Handle full-screen details view - only allow escape to close
+    if (isFullScreenDetailsOpen) {
+      if (key.escape) {
+        setIsFullScreenDetailsOpen(false);
+      }
+      return;
+    }
+
+    // Handle fuzzy search mode - allow navigation and essential keys to pass through
+    if (isFuzzySearchMode) {
+      if (key.escape) {
+        setIsFuzzySearchMode(false);
+        setFuzzySearchQuery('');
+        return;
+      }
+      // Allow navigation keys and essential commands to pass through
+      if (input === 'q' || input === 'Q' || 
+          key.upArrow || key.downArrow || key.leftArrow || key.rightArrow || 
+          key.return || input === 'l' || input === 'L' || 
+          input === 'i' || input === 'I' || 
+          input === 'n' || input === 'N' || 
+          input === 'p' || input === 'P' ||
+          input === 'h' || input === 'H' ||
+          input === 'm' || input === 'M') {
+        return; // Let these pass through to main navigation handler
+      }
+      // Block all other keys when in search mode to let TextInput handle them
+      return;
+    }
+
     // Handle options menu navigation
     if (externalActions.isMenuOpen) {
-      if (key.upArrow) {
-        externalActions.navigateUp();
-      } else if (key.downArrow) {
-        externalActions.navigateDown();
-      } else if (key.return) {
-        handleOptionSelect();
-      } else if (key.escape) {
-        externalActions.closeMenu();
+      // Prevent navigation while loading
+      if (!externalActions.isLoading) {
+        if (key.upArrow) {
+          externalActions.navigateUp();
+        } else if (key.downArrow) {
+          externalActions.navigateDown();
+        } else if (key.return) {
+          handleOptionSelect();
+        } else if (key.escape) {
+          externalActions.closeMenu();
+        }
       }
       return; // Don't handle other navigation when menu is open
     }
 
+    // Handle multi-select mode commands
+    if (input === 'm' || input === 'M') {
+      // Toggle multi-select mode
+      setIsMultiSelectMode(!isMultiSelectMode);
+      if (isMultiSelectMode) {
+        // Exiting multi-select mode, clear selections
+        setSelectedCustomerIds(new Set());
+      }
+    } else if (isMultiSelectMode && (input === 's' || input === 'S')) {
+      // Toggle selection of current customer
+      const currentCustomer = currentCustomers[selectedCustomerIndex];
+      if (currentCustomer) {
+        const newSelectedIds = new Set(selectedCustomerIds);
+        if (newSelectedIds.has(currentCustomer.customer.id)) {
+          newSelectedIds.delete(currentCustomer.customer.id);
+        } else {
+          newSelectedIds.add(currentCustomer.customer.id);
+        }
+        setSelectedCustomerIds(newSelectedIds);
+      }
+    } else if (isMultiSelectMode && (input === 'a' || input === 'A')) {
+      // Toggle all visible customers
+      const currentCustomerIds = currentCustomers.map(c => c.customer.id);
+      const allSelected = currentCustomerIds.every(id => selectedCustomerIds.has(id));
+      
+      if (allSelected) {
+        // Deselect all current page customers
+        const newSelectedIds = new Set(selectedCustomerIds);
+        currentCustomerIds.forEach(id => newSelectedIds.delete(id));
+        setSelectedCustomerIds(newSelectedIds);
+      } else {
+        // Select all current page customers
+        const newSelectedIds = new Set(selectedCustomerIds);
+        currentCustomerIds.forEach(id => newSelectedIds.add(id));
+        setSelectedCustomerIds(newSelectedIds);
+      }
+    }
+
     // Handle main table navigation
-    if (key.leftArrow && currentPage > 0) {
-      setCurrentPage(currentPage - 1);
-    } else if (key.rightArrow && currentPage < totalPages - 1) {
-      setCurrentPage(currentPage + 1);
+    if ((input === 'l' || input === 'L') && currentCustomers[selectedCustomerIndex]) {
+      // L: Open full-screen customer details
+      setIsFullScreenDetailsOpen(true);
     } else if (key.upArrow && selectedCustomerIndex > 0) {
       setSelectedCustomerIndex(selectedCustomerIndex - 1);
     } else if (key.downArrow && selectedCustomerIndex < currentCustomers.length - 1) {
       setSelectedCustomerIndex(selectedCustomerIndex + 1);
+    } else if (key.leftArrow) {
+      // Left Arrow: Previous page
+      if (currentPage > 0) {
+        setCurrentPage(currentPage - 1);
+      }
+    } else if (key.rightArrow) {
+      // Right Arrow: Next page
+      if (currentPage < totalPages - 1) {
+        setCurrentPage(currentPage + 1);
+      }
     } else if (key.return && currentCustomers[selectedCustomerIndex]) {
+      // Enter: Open actions menu (for single or multiple selection)
       externalActions.openMenu();
-    } else if (input === 'f' || input === 'F') {
+    } else if (input === 'i' || input === 'I') {
       setHideZeroCreditUsers(!hideZeroCreditUsers);
-    } else if (input === 'd' || input === 'D') {
-      customerDetails.toggleDetails();
+    } else if (input === 'f' || input === 'F') {
+      setIsFuzzySearchMode(true);
+      setFuzzySearchQuery('');
+    } else if (input === 'c' || input === 'C') {
+      // Clear fuzzy search
+      setFuzzySearchQuery('');
+      setCurrentPage(0);
+      setSelectedCustomerIndex(0);
+    } else if (input === 'n' || input === 'N') {
+      // 'N' key: Next page
+      if (currentPage < totalPages - 1) {
+        setCurrentPage(currentPage + 1);
+      }
+    } else if (input === 'p' || input === 'P') {
+      // 'P' key: Previous page  
+      if (currentPage > 0) {
+        setCurrentPage(currentPage - 1);
+      }
+    } else if (input === 'h' || input === 'H') {
+      // 'H' key: Show help
+      setIsHelpOpen(true);
     }
   });
 
   // Prepare data for custom table
   const tableData = currentCustomers.map(({ customer, planPrice, creditsUsed, totalValue }, index) => {
     const credits = creditSystem.getCreditsForCustomer(customer);
+    const isCurrentSelected = index === selectedCustomerIndex;
+    const isMultiSelected = selectedCustomerIds.has(customer.id);
+    
     return {
       ID: customer.id.slice(0, 8) + '...',
       Name: (customer.name || 'N/A').slice(0, 15),
@@ -347,7 +609,9 @@ const CustomerTable: React.FC<CustomerTableProps> = ({
       'Total ($)': totalValue.toFixed(2),
       Stripe: customer.stripe_id ? '✓' : '✗',
       Env: (customer.env || 'unknown').slice(0, 5),
-      _isSelected: index === selectedCustomerIndex
+      _isSelected: isCurrentSelected,
+      _isMultiSelected: isMultiSelected,
+      _customerId: customer.id
     };
   });
 
@@ -367,39 +631,264 @@ const CustomerTable: React.FC<CustomerTableProps> = ({
   const selectedCustomer = currentCustomers[selectedCustomerIndex];
 
   return (
-    <Box flexDirection="column" borderStyle="round" borderColor="green" padding={1}>
-      <Box flexDirection="row" justifyContent="space-between" alignItems="center">
+    <Box flexDirection="column">
+      {/* Fuzzy Search Input - Static Layout */}
+      <Box
+        borderStyle="round"
+        borderColor={isFuzzySearchMode ? "yellow" : "gray"}
+        // padding={1}
+        // marginBottom={1}
+        height={3} // Fixed height to prevent layout shift
+      >
+        <Box flexDirection="column">
+          <Text color={isFuzzySearchMode ? "yellow" : "gray"} bold>
+            {isFuzzySearchMode ? "🔍 Search Mode (Esc to cancel)" : "🔍 Search"}
+          </Text>
+          {isFuzzySearchMode ? (
+            <TextInput
+              placeholder="Enter search query..."
+              onSubmit={(query) => {
+                setFuzzySearchQuery(query);
+                setIsFuzzySearchMode(false);
+                setCurrentPage(0); // Reset to first page
+                setSelectedCustomerIndex(0); // Reset selection
+              }}
+              onChange={(query) => {
+                setFuzzySearchQuery(query);
+                setCurrentPage(0); // Reset to first page when query changes
+                setSelectedCustomerIndex(0); // Reset selection
+              }}
+            />
+          ) : (
+            <Text color="gray">
+              {fuzzySearchQuery ?
+                `🔍 "${fuzzySearchQuery}" (${sortedCustomers.length} results) | F: modify, C: clear` :
+                isMultiSelectMode ? 
+                  "M: exit multi-select | S: toggle current | A: toggle all | Enter: batch actions" :
+                  "F: search, I: toggle $0 filter, M: multi-select mode"
+              }
+            </Text>
+          )}
+        </Box>
+      </Box>
+
+      {/* Header */}
+      <Box flexDirection="row" justifyContent="space-between" alignItems="center" marginBottom={1}>
         <Text color="green" bold>
           {planName} Customers (Page {currentPage + 1}/{totalPages})
+          {isMultiSelectMode && (
+            <Text color="magenta" bold> [MULTI-SELECT: {selectedCustomerIds.size} selected]</Text>
+          )}
         </Text>
         <Text color={hideZeroCreditUsers ? 'yellow' : 'gray'}>
-          {hideZeroCreditUsers
-            ? `Showing ${filteredCount}/${totalCustomersBeforeFilter} (hiding $0 credits)`
-            : `Showing all ${totalCustomersBeforeFilter} customers`
-          }
+          Showing {filteredCount}{!fuzzySearchQuery ? `/${totalCustomersBeforeFilter}` : ''} customers
+          {hideZeroCreditUsers && <Text color="yellow"> (hiding $0 credits)</Text>}
         </Text>
       </Box>
+{/* 
+      <Text color="gray" marginBottom={1}>
+        Press H for help
+      </Text> */}
 
-      <Text color="gray">
-        Left/right: pages, up/down: select, Enter: options, F: toggle $0 filter, D: toggle details, Esc: back
-      </Text>
+      {/* 60/40 Split Layout */}
+      <Box flexDirection="row" gap={1}>
+        {/* 60% - Customer Table */}
+        <Box width="60%" borderStyle="round" borderColor="green" padding={1} height={16}>
+          {/* <Text color="green" bold marginBottom={1}>Customer List</Text> */}
+          <CustomTableWithHighlight data={tableData} columns={columns} />
+        </Box>
 
-      <Box marginTop={1}>
-        <CustomTableWithHighlight data={tableData} columns={columns} />
+        {/* 40% - Custom Customer Details */}
+        <Box width="40%">
+          {selectedCustomer ? (
+            <customerDetails.DetailsComponent
+              customer={selectedCustomer.customer}
+              planName={planName}
+              planPrice={selectedCustomer.planPrice}
+              creditSystem={config.creditSystem}
+            />
+          ) : (
+            <Box borderStyle="round" borderColor="gray" padding={1}>
+              <Text color="gray">Select a customer to view details</Text>
+            </Box>
+          )}
+        </Box>
       </Box>
 
-      {/* Customer Details */}
-      {customerDetails.showDetails && selectedCustomer && (
-        <customerDetails.DetailsComponent
-          customer={selectedCustomer.customer}
-          planName={planName}
-          planPrice={selectedCustomer.planPrice}
-          creditSystem={config.creditSystem}
-        />
+
+      {/* Full-screen Customer Details */}
+      {isFullScreenDetailsOpen && selectedCustomer && (
+        <FullScreenDetails
+          isOpen={isFullScreenDetailsOpen}
+          onClose={() => setIsFullScreenDetailsOpen(false)}
+          title={`User Settings - ${selectedCustomer.customer.name || selectedCustomer.customer.id.slice(0, 8)}`}
+        >
+          <customerDetails.DetailsComponent
+            fullScreen={true}
+            customer={selectedCustomer.customer}
+            planName={planName}
+            planPrice={selectedCustomer.planPrice}
+            creditSystem={config.creditSystem}
+          />
+        </FullScreenDetails>
+      )}
+
+      {/* Help Screen */}
+      {isHelpOpen && (
+        <FullScreenDetails
+          isOpen={isHelpOpen}
+          onClose={() => setIsHelpOpen(false)}
+          title="Help - Keyboard Shortcuts"
+        >
+          <Box flexDirection="column" padding={2}>
+            <Text color="cyan" bold marginBottom={2}>🔧 ATMN CLI Max - Keyboard Shortcuts</Text>
+            
+            <Box flexDirection="column" marginBottom={2}>
+              <Text color="yellow" bold>Customer List Navigation:</Text>
+              <Box flexDirection="column" marginLeft={2}>
+                <Text>• ↑/↓ (Up/Down Arrows) - Select customer</Text>
+                <Text>• ←/→ (Left/Right Arrows) - Navigate pages</Text>
+                <Text>• P/N - Previous/Next page</Text>
+                <Text>• Enter - Open actions menu for selected customer(s)</Text>
+                <Text>• L - Open full screen customer details</Text>
+                <Text>• M - Toggle multi-select mode</Text>
+                <Text>• S - Toggle selection (when in multi-select mode)</Text>
+                <Text>• A - Toggle all visible customers (when in multi-select mode)</Text>
+              </Box>
+            </Box>
+
+            <Box flexDirection="column" marginBottom={2}>
+              <Text color="yellow" bold>Search & Filter:</Text>
+              <Box flexDirection="column" marginLeft={2}>
+                <Text>• F - Enter fuzzy search mode</Text>
+                <Text>• C - Clear current search</Text>
+                <Text>• I - Toggle $0 credit filter (hide/show)</Text>
+              </Box>
+            </Box>
+
+            <Box flexDirection="column" marginBottom={2}>
+              <Text color="yellow" bold>Views & Navigation:</Text>
+              <Box flexDirection="column" marginLeft={2}>
+                <Text>• 1 - View Plans overview</Text>
+                <Text>• 2 - View Customers (current plan)</Text>
+                <Text>• 3 - View Overall Summary</Text>
+                <Text>• H - Toggle this help screen</Text>
+                <Text>• Esc - Go back / Close modals</Text>
+                <Text>• Q - Quit application</Text>
+              </Box>
+            </Box>
+
+            <Box flexDirection="column" marginBottom={2}>
+              <Text color="yellow" bold>Actions Menu (when open):</Text>
+              <Box flexDirection="column" marginLeft={2}>
+                <Text>• ↑/↓ - Navigate actions</Text>
+                <Text>• Enter - Execute selected action</Text>
+                <Text>• Esc - Close actions menu</Text>
+              </Box>
+            </Box>
+
+            <Box flexDirection="column" marginBottom={2}>
+              <Text color="yellow" bold>Search Mode (when active):</Text>
+              <Box flexDirection="column" marginLeft={2}>
+                <Text>• Type to search customers</Text>
+                <Text>• Enter - Apply search and exit search mode</Text>
+                <Text>• Esc - Cancel search and exit search mode</Text>
+              </Box>
+            </Box>
+
+            <Text color="gray" marginTop={2}>
+              Press H or Esc to close this help screen
+            </Text>
+          </Box>
+        </FullScreenDetails>
+      )}
+
+      {/* Component Dialog */}
+      {externalActions.isComponentDialogOpen && externalActions.componentDialog && (
+        <FullScreenDetails
+          isOpen={externalActions.isComponentDialogOpen}
+          onClose={externalActions.closeComponentDialog}
+          title="Action Result"
+        >
+          {externalActions.componentDialog}
+        </FullScreenDetails>
+      )}
+
+      {/* Batch Migration Progress View */}
+      {isBatchMigrationInProgress && (
+        <FullScreenDetails
+          isOpen={isBatchMigrationInProgress}
+          onClose={() => {
+            setIsBatchMigrationInProgress(false);
+            setMigrationStatuses(new Map());
+            setIsMultiSelectMode(false);
+            setSelectedCustomerIds(new Set());
+          }}
+          title="Batch Migration Progress"
+        >
+          <Box flexDirection="column" padding={1}>
+            <Text color="cyan" bold marginBottom={2}>🚀 Batch Migration in Progress</Text>
+            
+            {/* Migration Status Table */}
+            <Box flexDirection="column">
+              <Text bold color="yellow" marginBottom={1}>Migration Status:</Text>
+              
+              {/* Table Header */}
+              <Box flexDirection="row">
+                <Text bold color="cyan">Customer (25 chars)</Text>
+                <Text bold color="cyan">Status (15 chars)</Text>
+                <Text bold color="cyan">Message (40 chars)</Text>
+              </Box>
+              
+              {/* Separator */}
+              <Text color="gray">{'─'.repeat(80)}</Text>
+              
+              {/* Migration rows */}
+              {Array.from(migrationStatuses.entries()).map(([customerId, status]) => {
+                const customer = currentCustomers.find(c => c.customer.id === customerId)?.customer;
+                const customerName = customer?.name || customer?.email || customerId.slice(0, 12);
+                
+                let statusColor = 'gray';
+                let statusIcon = '⏳';
+                
+                switch (status.status) {
+                  case 'pending':
+                    statusColor = 'gray';
+                    statusIcon = '⏳';
+                    break;
+                  case 'in_progress':
+                    statusColor = 'yellow';
+                    statusIcon = '🔄';
+                    break;
+                  case 'completed':
+                    statusColor = 'green';
+                    statusIcon = '✅';
+                    break;
+                  case 'failed':
+                    statusColor = 'red';
+                    statusIcon = '❌';
+                    break;
+                }
+                
+                return (
+                  <Box key={customerId} flexDirection="row">
+                    <Text color="white">{customerName.slice(0, 22).padEnd(25)}</Text>
+                    <Text color={statusColor}>{(statusIcon + ' ' + status.status.toUpperCase()).padEnd(15)}</Text>
+                    <Text color="gray">{(status.message || '').padEnd(40)}</Text>
+                  </Box>
+                );
+              })}
+            </Box>
+            
+            <Box marginTop={2}>
+              <Text color="gray">Press Esc to close (you can close during migration)</Text>
+            </Box>
+          </Box>
+        </FullScreenDetails>
       )}
 
       {/* Options Menu */}
-      {externalActions.isMenuOpen && selectedCustomer && (
+      {externalActions.isMenuOpen && (
         <Box
           marginTop={2}
           borderStyle="round"
@@ -409,20 +898,53 @@ const CustomerTable: React.FC<CustomerTableProps> = ({
         >
           <Box flexDirection="column">
             <Text color="yellow" bold>
-              Open Customer: {selectedCustomer.customer.id}
+              {isMultiSelectMode && selectedCustomerIds.size > 0 ? (
+                `Batch Actions for ${selectedCustomerIds.size} selected customers`
+              ) : selectedCustomer ? (
+                `Actions for: ${selectedCustomer.customer.name || selectedCustomer.customer.id.slice(0, 12)}`
+              ) : (
+                'Actions'
+              )}
             </Text>
             <Box marginTop={1} flexDirection="column">
-              {externalActions.actions.map((action, index) => (
-                <Text
-                  key={action.id}
-                  color={index === externalActions.selectedActionIndex ? 'black' : 'white'}
-                  backgroundColor={index === externalActions.selectedActionIndex ? 'yellow' : undefined}
-                >
-                  {index === externalActions.selectedActionIndex ? '→ ' : '  '}{index + 1}. {action.label}
-                </Text>
-              ))}
+              {externalActions.actions.map((action, index) => {
+                const isSelected = index === externalActions.selectedActionIndex;
+                const isExecuting = externalActions.executingActionId === action.id;
+                const showStatus = isExecuting && externalActions.currentStatus;
+                
+                return (
+                  <Box key={action.id} flexDirection="column">
+                    <Box flexDirection="row" alignItems="center">
+                      <Text
+                        color={isSelected ? 'black' : 'white'}
+                        backgroundColor={isSelected ? 'yellow' : undefined}
+                      >
+                        {isSelected ? '→ ' : '  '}{index + 1}. {action.label}
+                      </Text>
+                      {isExecuting && (
+                        <Box marginLeft={1} flexDirection="row" alignItems="center">
+                          <Spinner />
+                          <Text color="cyan" marginLeft={1}>
+                            {externalActions.isLoading ? 'Running...' : 'Done'}
+                          </Text>
+                        </Box>
+                      )}
+                    </Box>
+                    {showStatus && (
+                      <Text color="gray" marginLeft={4}>
+                        Status: {externalActions.currentStatus}
+                      </Text>
+                    )}
+                  </Box>
+                );
+              })}
             </Box>
-            <Text color="gray" marginTop={1}>Use ↑↓ to navigate, Enter to select, Esc to cancel</Text>
+            <Text color="gray" marginTop={1}>
+              {externalActions.isLoading ? 
+                'Executing action... Please wait' : 
+                'Use ↑↓ to navigate, Enter to select, Esc to cancel'
+              }
+            </Text>
           </Box>
         </Box>
       )}
@@ -564,11 +1086,33 @@ const BillingAnalysisApp: React.FC<BillingAnalysisAppProps> = ({
   const [grandTotalSubscriptionRevenue, setGrandTotalSubscriptionRevenue] = useState(0);
   const [grandTotalCredits, setGrandTotalCredits] = useState(0);
   const [isAnyMenuOpen, setIsAnyMenuOpen] = useState(false);
+  const [isAnyModalOpen, setIsAnyModalOpen] = useState(false);
+  const [isHelpOpen, setIsHelpOpen] = useState(false);
 
   const sortedPlans = Object.entries(planAnalysis).sort(([, a], [, b]) => b.customerCount - a.customerCount);
   const creditSystem = useCreditSystem(config.creditSystem);
 
   useInput((input, key) => {
+    // Always allow quit, but block other inputs when modal/search is open
+    // if ((input === 'q' || input === 'Q')) {
+    //   process.exit(0);
+    //   return;
+    // }
+
+    // Handle help screen at app level
+    if (isHelpOpen) {
+      if (key.escape || input === 'h' || input === 'H') {
+        setIsHelpOpen(false);
+      }
+      return;
+    }
+
+    // Block ALL other key handling when any modal or search is open
+    // This prevents interference with text input in search mode
+    if (isAnyModalOpen) {
+      return;
+    }
+
     if (view === 'plans') {
       if (key.upArrow && selectedPlanIndex > 0) {
         setSelectedPlanIndex(selectedPlanIndex - 1);
@@ -579,9 +1123,7 @@ const BillingAnalysisApp: React.FC<BillingAnalysisAppProps> = ({
       }
     }
 
-    if (input === 'q') {
-      process.exit(0);
-    } else if (key.escape && !isAnyMenuOpen) {
+    if (key.escape) {
       if (view === 'customers') {
         setView('plans');
       } else {
@@ -593,6 +1135,8 @@ const BillingAnalysisApp: React.FC<BillingAnalysisAppProps> = ({
       setView('customers');
     } else if (input === '3') {
       setView('summary');
+    } else if (input === 'h' || input === 'H') {
+      setIsHelpOpen(true);
     } else if (key.backspace || input === 'b') {
       if (view === 'customers') {
         setView('plans');
@@ -770,7 +1314,7 @@ const BillingAnalysisApp: React.FC<BillingAnalysisAppProps> = ({
           <Text color={view === 'plans' ? 'yellow' : 'gray'}>[1] Plans</Text>
           <Text color={view === 'customers' ? 'yellow' : 'gray'}>[2] Customers</Text>
           <Text color={view === 'summary' ? 'yellow' : 'gray'}>[3] Summary</Text>
-          <Text color="gray">[Q] Quit</Text>
+          <Text color="gray">[H] Help</Text>
         </Box>
       </Box>
 
@@ -788,6 +1332,7 @@ const BillingAnalysisApp: React.FC<BillingAnalysisAppProps> = ({
           planName={sortedPlans[selectedPlanIndex][0]}
           livePlanPrices={livePlanPrices}
           onMenuStateChange={setIsAnyMenuOpen}
+          onModalStateChange={setIsAnyModalOpen}
           config={config}
         />
       )}
@@ -802,13 +1347,89 @@ const BillingAnalysisApp: React.FC<BillingAnalysisAppProps> = ({
         />
       )}
 
-      <Box marginTop={1} borderStyle="single" borderColor="gray" padding={1}>
+      {/* Global Help Screen */}
+      {isHelpOpen && (
+        <FullScreenDetails
+          isOpen={isHelpOpen}
+          onClose={() => setIsHelpOpen(false)}
+          title="Help - Keyboard Shortcuts"
+        >
+          <Box flexDirection="column" padding={2}>
+            <Text color="cyan" bold marginBottom={2}>🔧 ATMN CLI Max - Keyboard Shortcuts</Text>
+            
+            <Box flexDirection="column" marginBottom={2}>
+              <Text color="yellow" bold>Global Navigation:</Text>
+              <Box flexDirection="column" marginLeft={2}>
+                <Text>• 1 - View Plans overview</Text>
+                <Text>• 2 - View Customers (current plan)</Text>
+                <Text>• 3 - View Overall Summary</Text>
+                <Text>• H - Toggle this help screen</Text>
+                <Text>• Q - Quit application</Text>
+                <Text>• Esc - Go back / Close modals</Text>
+              </Box>
+            </Box>
+
+            <Box flexDirection="column" marginBottom={2}>
+              <Text color="yellow" bold>Plans View:</Text>
+              <Box flexDirection="column" marginLeft={2}>
+                <Text>• ↑/↓ - Select plan</Text>
+                <Text>• Enter - View customers for selected plan</Text>
+              </Box>
+            </Box>
+
+            <Box flexDirection="column" marginBottom={2}>
+              <Text color="yellow" bold>Customer List Navigation:</Text>
+              <Box flexDirection="column" marginLeft={2}>
+                <Text>• ↑/↓ (Up/Down Arrows) - Select customer</Text>
+                <Text>• ←/→ (Left/Right Arrows) - Navigate pages</Text>
+                <Text>• P/N - Previous/Next page</Text>
+                <Text>• Enter - Open actions menu for selected customer(s)</Text>
+                <Text>• L - Open full screen customer details</Text>
+                <Text>• M - Toggle multi-select mode</Text>
+                <Text>• S - Toggle selection (when in multi-select mode)</Text>
+                <Text>• A - Toggle all visible customers (when in multi-select mode)</Text>
+              </Box>
+            </Box>
+
+            <Box flexDirection="column" marginBottom={2}>
+              <Text color="yellow" bold>Search & Filter:</Text>
+              <Box flexDirection="column" marginLeft={2}>
+                <Text>• F - Enter fuzzy search mode</Text>
+                <Text>• C - Clear current search</Text>
+                <Text>• I - Toggle $0 credit filter (hide/show)</Text>
+              </Box>
+            </Box>
+
+            <Box flexDirection="column" marginBottom={2}>
+              <Text color="yellow" bold>Actions Menu (when open):</Text>
+              <Box flexDirection="column" marginLeft={2}>
+                <Text>• ↑/↓ - Navigate actions</Text>
+                <Text>• Enter - Execute selected action</Text>
+                <Text>• Esc - Close actions menu</Text>
+              </Box>
+            </Box>
+
+            <Box flexDirection="column" marginBottom={2}>
+              <Text color="yellow" bold>Search Mode (when active):</Text>
+              <Box flexDirection="column" marginLeft={2}>
+                <Text>• Type to search customers</Text>
+                <Text>• Enter - Apply search and exit search mode</Text>
+                <Text>• Esc - Cancel search and exit search mode</Text>
+              </Box>
+            </Box>
+
+            <Text color="gray" marginTop={2}>
+              Press H or Esc to close this help screen
+            </Text>
+          </Box>
+        </FullScreenDetails>
+      )}
+
+      {/* <Box marginTop={1} borderStyle="single" borderColor="gray" padding={1}>
         <Text color="gray">
-          Navigation: {view === 'plans' ? 'Up/Down: Select Plan, Enter: View Customers' :
-            view === 'customers' ? 'Left/Right: Navigate Pages, Up/Down: Select Customer, Enter: Show Options, F: Toggle $0 Filter, D: Toggle Details, Esc: Back to Plans' :
-              'Use number keys to switch views'} | Q: Quit
+          Press H.
         </Text>
-      </Box>
+      </Box> */}
     </Box>
   );
 };

@@ -5,7 +5,8 @@ export interface ActionOption {
   id: string;
   label: string;
   description?: string;
-  handler: (customerId: string, customer?: any) => void | Promise<void>;
+  handler: (customerId: string, customer?: any, setStatus?: (status: string) => void) => void | Promise<void> | React.ReactElement | Promise<React.ReactElement>;
+  batchHandler?: (customerIds: string[], customers: any[], statusCallback?: (customerId: string, status: string) => void) => Promise<void>;
 }
 
 export interface ExternalActionsConfig {
@@ -44,13 +45,97 @@ export const executeAction = (actionId: string, customerId: string, customer: an
 export const useExternalActions = (config: ExternalActionsConfig = defaultActionsConfig) => {
   const [selectedActionIndex, setSelectedActionIndex] = React.useState(0);
   const [isMenuOpen, setIsMenuOpen] = React.useState(false);
+  const [isLoading, setIsLoading] = React.useState(false);
+  const [currentStatus, setCurrentStatus] = React.useState<string | null>(null);
+  const [executingActionId, setExecutingActionId] = React.useState<string | null>(null);
+  const [componentDialog, setComponentDialog] = React.useState<React.ReactElement | null>(null);
+  const [isComponentDialogOpen, setIsComponentDialogOpen] = React.useState(false);
 
-  const executeSelectedAction = (customerId: string, customer?: any) => {
+  const executeSelectedAction = async (customerId: string, customer?: any) => {
     const action = config.actions[selectedActionIndex];
     if (action) {
-      action.handler(customerId, customer);
+      setIsLoading(true);
+      setCurrentStatus(null);
+      setExecutingActionId(action.id);
+      
+      const updateStatus = (status: string) => {
+        setCurrentStatus(status);
+      };
+      
+      try {
+        const result = action.handler(customerId, customer, updateStatus);
+        
+        let finalResult;
+        // Check if the result is a Promise
+        if (result instanceof Promise) {
+          finalResult = await result;
+        } else {
+          finalResult = result;
+        }
+        
+        // Check if the result is a React component
+        if (React.isValidElement(finalResult)) {
+          setComponentDialog(finalResult);
+          setIsComponentDialogOpen(true);
+          setIsLoading(false);
+          setCurrentStatus(null);
+          setExecutingActionId(null);
+          setIsMenuOpen(false);
+          setSelectedActionIndex(0);
+          return;
+        }
+        
+      } catch (error) {
+        setCurrentStatus(`Error: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        // Wait a bit to show the error before closing
+        setTimeout(() => {
+          setIsLoading(false);
+          setCurrentStatus(null);
+          setExecutingActionId(null);
+          setIsMenuOpen(false);
+          setSelectedActionIndex(0);
+        }, 2000);
+        return;
+      }
+      
+      setIsLoading(false);
+      setCurrentStatus(null);
+      setExecutingActionId(null);
       setIsMenuOpen(false);
       setSelectedActionIndex(0);
+    }
+  };
+
+  const executeBatchAction = async (action: ActionOption, customerIds: string[], customers: any[], statusCallback?: (customerId: string, status: string) => void) => {
+    try {
+      if (action.batchHandler) {
+        // Use the custom batch handler if provided
+        await action.batchHandler(customerIds, customers, statusCallback);
+      } else {
+        // Fallback: execute individual actions sequentially
+        for (let i = 0; i < customerIds.length; i++) {
+          const customerId = customerIds[i];
+          const customer = customers[i];
+          
+          if (!customerId || !customer) {
+            console.error('Invalid customer data at index', i);
+            continue;
+          }
+          
+          const individualStatusCallback = (status: string) => {
+            statusCallback?.(customerId, status);
+          };
+          
+          const result = action.handler(customerId, customer, individualStatusCallback);
+          
+          if (result instanceof Promise) {
+            await result;
+          }
+        }
+      }
+    } catch (error) {
+      console.error(`Batch action failed:`, error);
+      throw error;
     }
   };
 
@@ -60,8 +145,12 @@ export const useExternalActions = (config: ExternalActionsConfig = defaultAction
   };
 
   const closeMenu = () => {
-    setIsMenuOpen(false);
-    setSelectedActionIndex(0);
+    if (!isLoading) {
+      setIsMenuOpen(false);
+      setSelectedActionIndex(0);
+      setCurrentStatus(null);
+      setExecutingActionId(null);
+    }
   };
 
   const navigateUp = () => {
@@ -76,14 +165,26 @@ export const useExternalActions = (config: ExternalActionsConfig = defaultAction
     }
   };
 
+  const closeComponentDialog = () => {
+    setIsComponentDialogOpen(false);
+    setComponentDialog(null);
+  };
+
   return {
     selectedActionIndex,
     isMenuOpen,
+    isLoading,
+    currentStatus,
+    executingActionId,
     actions: config.actions,
     executeSelectedAction,
+    executeBatchAction,
     openMenu,
     closeMenu,
     navigateUp,
-    navigateDown
+    navigateDown,
+    componentDialog,
+    isComponentDialogOpen,
+    closeComponentDialog
   };
 };

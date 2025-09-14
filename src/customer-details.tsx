@@ -1,6 +1,7 @@
 import React from 'react';
 import { Box, Text } from 'ink';
 import { getCustomerCredits, type CreditSystemConfig } from './credit-system';
+import { type Feature } from 'autumn-js';
 
 // Types
 export interface Customer {
@@ -11,14 +12,11 @@ export interface Customer {
   env?: string;
   created_at?: string;
   products?: any[];
-  features?: {
-    [key: string]: {
-      balance?: number;
-    };
-  };
+  features?: Feature;
 }
 
 export interface CustomerDetailsProps {
+  fullScreen?: boolean;
   customer: Customer;
   planName: string;
   planPrice: number;

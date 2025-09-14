@@ -1,7 +1,7 @@
 # dependencies (bun install)
 node_modules
 
-cd-dashboard.tsx
+cd
 
 # output
 out

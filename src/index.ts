@@ -82,9 +82,24 @@ export {
   useCustomerDetails
 } from './customer-details';
 
+// JSON Rendering Components
+export type {
+  JsonRendererProps,
+  FieldConfig
+} from './json-renderer';
+export {
+  JsonObjectRenderer,
+  CompactJsonRenderer,
+  DetailedJsonRenderer,
+  FullScreenDetails,
+  useJsonRenderer,
+  defaultFieldConfigs
+} from './json-renderer';
+
 // Re-export everything for convenience
 export * from './main';
 export * from './billing-config';
 export * from './external-actions';
 export * from './credit-system';
 export * from './customer-details';
+export * from './json-renderer';
